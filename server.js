@@ -1,5 +1,23 @@
-// Updated start-verification endpoint with better error handling
+const express = require("express");
+const puppeteer = require("puppeteer-core");
+const chromium = require("@sparticuz/chromium");
 
+const app = express();
+app.use(express.json());
+
+// Store active sessions
+const sessions = new Map();
+
+// Optional API key authentication
+const API_KEY = process.env.API_KEY;
+app.use((req, res, next) => {
+  if (API_KEY && req.headers["x-api-key"] !== API_KEY) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  next();
+});
+
+// Start verification process with better error handling
 app.post("/start-verification", async (req, res) => {
   const { emailAddress, smsPhone, password, domain } = req.body;
   const sessionId = Date.now().toString();
@@ -240,7 +258,91 @@ app.post("/start-verification", async (req, res) => {
   }
 });
 
-// Add a test endpoint to check if login works
+// Submit SMS code
+app.post("/submit-code", async (req, res) => {
+  const { sessionId, smsCode } = req.body;
+
+  if (!sessions.has(sessionId)) {
+    return res.status(404).json({
+      status: "error",
+      message: "Session not found or expired",
+    });
+  }
+
+  const session = sessions.get(sessionId);
+
+  try {
+    const { page, browser } = session;
+
+    // Find code input - Google uses different selectors
+    const codeInput =
+      (await page.$('input[type="tel"]')) ||
+      (await page.$('input[type="text"]')) ||
+      (await page.$('input[id*="idvPin"]'));
+
+    if (!codeInput) {
+      throw new Error("SMS code input field not found");
+    }
+
+    // Clear and enter code
+    await codeInput.click({ clickCount: 3 });
+    await page.keyboard.type(smsCode, { delay: 100 });
+
+    // Submit code
+    const submitButton =
+      (await page.$('button[jsname="LgbsSe"]')) ||
+      (await page.$('div[data-mdc-dialog-action="next"]'));
+
+    if (submitButton) {
+      await submitButton.click();
+    } else {
+      await page.keyboard.press("Enter");
+    }
+
+    // Wait for result
+    await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15000 });
+
+    const finalUrl = page.url();
+    const finalContent = await page.content();
+
+    // Check if verification successful
+    const success =
+      finalUrl.includes("myaccount.google.com") ||
+      finalContent.includes("Google Account") ||
+      (!finalContent.includes("Wrong code") &&
+        !finalContent.includes("Try again"));
+
+    // Clean up
+    await browser.close();
+    sessions.delete(sessionId);
+
+    if (success) {
+      res.json({
+        status: "success",
+        message: "Phone verification completed successfully",
+      });
+    } else {
+      res.json({
+        status: "error",
+        message: "Invalid code or verification failed",
+      });
+    }
+  } catch (error) {
+    console.error("Error in submit-code:", error);
+
+    try {
+      await session.browser.close();
+    } catch (e) {}
+    sessions.delete(sessionId);
+
+    res.status(500).json({
+      status: "error",
+      message: error.message,
+    });
+  }
+});
+
+// Test endpoint to check what happens after email entry
 app.post("/test-login", async (req, res) => {
   const { emailAddress } = req.body;
 
@@ -285,4 +387,92 @@ app.post("/test-login", async (req, res) => {
       message: error.message,
     });
   }
+});
+
+// Cancel session
+app.post("/cancel-session", async (req, res) => {
+  const { sessionId } = req.body;
+
+  if (sessions.has(sessionId)) {
+    try {
+      await sessions.get(sessionId).browser.close();
+    } catch (e) {}
+    sessions.delete(sessionId);
+  }
+
+  res.json({ status: "cancelled" });
+});
+
+// Get session status
+app.get("/session-status/:sessionId", (req, res) => {
+  const { sessionId } = req.params;
+
+  if (!sessions.has(sessionId)) {
+    return res.status(404).json({
+      status: "error",
+      message: "Session not found",
+    });
+  }
+
+  const session = sessions.get(sessionId);
+  res.json({
+    status: session.status,
+    emailAddress: session.emailAddress,
+    age: Date.now() - session.createdAt,
+  });
+});
+
+// Health check
+app.get("/health", (req, res) => {
+  res.json({
+    status: "healthy",
+    activeSessions: sessions.size,
+    uptime: process.uptime(),
+  });
+});
+
+// Root endpoint
+app.get("/", (req, res) => {
+  res.json({
+    service: "Google Account Verification API",
+    endpoints: {
+      "POST /start-verification": "Start verification process",
+      "POST /submit-code": "Submit SMS verification code",
+      "POST /test-login": "Test login to see what screen appears",
+      "POST /cancel-session": "Cancel active session",
+      "GET /session-status/:id": "Check session status",
+      "GET /health": "Health check",
+    },
+  });
+});
+
+const PORT = process.env.PORT || 3000;
+const SESSION_TIMEOUT = parseInt(process.env.SESSION_TIMEOUT) || 300000; // 5 minutes
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
+// Cleanup hanging sessions
+setInterval(async () => {
+  for (const [id, session] of sessions.entries()) {
+    if (Date.now() - session.createdAt > SESSION_TIMEOUT) {
+      console.log(`Cleaning up expired session ${id}`);
+      try {
+        await session.browser.close();
+      } catch (e) {}
+      sessions.delete(id);
+    }
+  }
+}, 60000); // Check every minute
+
+// Graceful shutdown
+process.on("SIGINT", async () => {
+  console.log("Shutting down gracefully...");
+  for (const [id, session] of sessions.entries()) {
+    try {
+      await session.browser.close();
+    } catch (e) {}
+  }
+  process.exit(0);
 });
